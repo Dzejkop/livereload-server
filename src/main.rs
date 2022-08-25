@@ -28,14 +28,17 @@ struct Args {
     port: u16,
 }
 
-async fn serve_file(target_dir: impl AsRef<Path>, mut path: &str) -> anyhow::Result<Vec<u8>> {
+async fn serve_file(
+    target_dir: impl AsRef<Path>,
+    mut path: &str,
+) -> anyhow::Result<Vec<u8>> {
     let target_dir = target_dir.as_ref();
 
     if path == "/" || path.is_empty() {
         path = "/index.html";
     }
 
-    let path = path.strip_prefix("/").unwrap_or(path);
+    let path = path.strip_prefix('/').unwrap_or(path);
 
     log::info!("Serving {path}");
 
@@ -53,15 +56,15 @@ async fn serve_file(target_dir: impl AsRef<Path>, mut path: &str) -> anyhow::Res
 
         data.bytes().collect()
     } else {
-        let data = tokio::fs::read(target_dir.join(path)).await?;
-
-        data
+        tokio::fs::read(target_dir.join(path)).await?
     };
 
     Ok(body)
 }
 
-fn async_watcher() -> notify::Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
+fn async_watcher(
+) -> notify::Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)>
+{
     let (tx, rx) = mpsc::channel(1);
 
     let watcher = RecommendedWatcher::new(
@@ -109,17 +112,16 @@ async fn main() -> anyhow::Result<()> {
         warp::any().map(move || args.clone())
     };
 
-    let default_route =
-        peek()
-            .and(args_filter)
-            .and_then(|peek: Peek, args: Arc<Args>| async move {
-                log::info!("Requested = {}", peek.as_str());
+    let default_route = peek().and(args_filter).and_then(
+        |peek: Peek, args: Arc<Args>| async move {
+            log::info!("Requested = {}", peek.as_str());
 
-                match serve_file(&args.as_ref().target_dir, peek.as_str()).await {
-                    Ok(res) => Ok(warp::reply::html(res)),
-                    Err(_) => Err(warp::reject()),
-                }
-            });
+            match serve_file(&args.as_ref().target_dir, peek.as_str()).await {
+                Ok(res) => Ok(warp::reply::html(res)),
+                Err(_) => Err(warp::reject()),
+            }
+        },
+    );
 
     let routes = ws_route.or(default_route);
 
