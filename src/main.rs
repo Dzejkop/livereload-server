@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use hyper::{Body, StatusCode};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use tokio::sync::mpsc;
@@ -11,6 +12,7 @@ use warp::ws::Message;
 use warp::Filter;
 
 const INJECTED_SCRIPT: &str = include_str!("./injected_script.js");
+const NOTIFY_CHANNEL_CAPACITY: usize = 5;
 
 #[derive(Debug, Clone, Parser)]
 #[clap(rename_all = "kebab-case")]
@@ -30,9 +32,11 @@ struct Args {
 
 async fn serve_file(
     target_dir: impl AsRef<Path>,
-    mut path: &str,
-) -> anyhow::Result<Vec<u8>> {
+    path_in_request: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let target_dir = target_dir.as_ref();
+
+    let mut path = path_in_request;
 
     if path == "/" || path.is_empty() {
         path = "/index.html";
@@ -40,10 +44,18 @@ async fn serve_file(
 
     let path = path.strip_prefix('/').unwrap_or(path);
 
-    log::info!("Serving {path}");
+    let path_in_target_dir = target_dir.join(path);
+
+    if !path_in_target_dir.exists() {
+        return Ok(None);
+    }
 
     let body = if path.ends_with(".html") {
-        let content = tokio::fs::read_to_string(target_dir.join(path)).await?;
+        log::info!(
+            "Serving HTML requested at {path} with {path_in_target_dir:?}"
+        );
+
+        let content = tokio::fs::read_to_string(path_in_target_dir).await?;
 
         let regex = Regex::new(r#"</body>"#)?;
 
@@ -56,28 +68,31 @@ async fn serve_file(
 
         data.bytes().collect()
     } else {
-        tokio::fs::read(target_dir.join(path)).await?
+        log::info!("Serving a non HTML file requested as {path_in_request} with {path_in_target_dir:?}");
+
+        tokio::fs::read(path_in_target_dir).await?
     };
 
-    Ok(body)
+    Ok(Some(body))
 }
 
 fn async_watcher(
 ) -> notify::Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)>
 {
-    let (tx, rx) = mpsc::channel(1);
+    let (notify_event_tx, notify_event_rx) =
+        mpsc::channel(NOTIFY_CHANNEL_CAPACITY);
 
     let watcher = RecommendedWatcher::new(
         move |res| {
-            match tx.try_send(res) {
+            match notify_event_tx.try_send(res) {
             Ok(()) => (),
-            Err(err) => log::error!("Failed to send an event to channel, the channel is likely closed {err}"),
+            Err(err) => log::error!("Failed to send an event to channel, the channel is likely closed: {err}"),
         }
         },
         Config::default(),
     )?;
 
-    Ok((watcher, rx))
+    Ok((watcher, notify_event_rx))
 }
 
 #[tokio::main]
@@ -107,13 +122,23 @@ async fn main() -> anyhow::Result<()> {
         warp::any().map(move || args.clone())
     };
 
-    let default_route = peek().and(args_filter).and_then(
+    let default_route = peek().and(args_filter).then(
         |peek: Peek, args: Arc<Args>| async move {
-            log::info!("Requested = {}", peek.as_str());
+            let builder = warp::http::Response::builder();
 
             match serve_file(&args.as_ref().target_dir, peek.as_str()).await {
-                Ok(res) => Ok(warp::reply::html(res)),
-                Err(_) => Err(warp::reject()),
+                Ok(Some(res)) => {
+                    builder.status(StatusCode::OK).body(Body::from(res))
+                }
+                Ok(None) => {
+                    builder.status(StatusCode::NOT_FOUND).body(Body::empty())
+                }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    builder
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from(err_msg))
+                }
             }
         },
     );
@@ -136,12 +161,30 @@ async fn handle_websocket(
 
     watcher.watch(&args.as_ref().target_dir, RecursiveMode::Recursive)?;
 
-    let (mut websocket_sender, _) = websocket.split();
+    let (mut websocket_tx, mut websocket_rx) = websocket.split();
 
-    while let Some(Ok(_)) = fs_events_receiver.recv().await {
-        let s = websocket_sender.send(Message::text("reload"));
+    loop {
+        tokio::select! {
+            Some(Ok(_)) = fs_events_receiver.recv() => {
+                let s = websocket_tx.send(Message::text("reload"));
 
-        s.await?;
+                s.await?;
+            }
+            Some(message) = websocket_rx.next() => {
+                match message {
+                    Ok(msg) => {
+                        if msg.is_close() {
+                            log::debug!("Websocket connection is closed");
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("An error occured: {err}");
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
