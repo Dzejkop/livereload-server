@@ -1,7 +1,7 @@
 [package]
 name = "livereload-server"
 description = "A server to serve static content and automatically reload it one a file in a directory has been changed"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Dzejkop <jakubtrad@gmail.com>"]
 repository = "https://github.com/Dzejkop/livereload-server"

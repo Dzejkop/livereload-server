@@ -69,7 +69,10 @@ fn async_watcher(
 
     let watcher = RecommendedWatcher::new(
         move |res| {
-            tx.try_send(res).unwrap();
+            match tx.try_send(res) {
+            Ok(()) => (),
+            Err(err) => log::error!("Failed to send an event to channel, the channel is likely closed {err}"),
+        }
         },
         Config::default(),
     )?;
@@ -90,18 +93,10 @@ async fn main() -> anyhow::Result<()> {
             let args = args.clone();
 
             ws.on_upgrade(move |websocket| async move {
-                let (mut watcher, mut rx) = async_watcher().unwrap();
-
-                watcher
-                    .watch(&args.as_ref().target_dir, RecursiveMode::Recursive)
-                    .unwrap();
-
-                let (mut tx, _) = websocket.split();
-
-                while let Some(Ok(_)) = rx.recv().await {
-                    let s = tx.send(Message::text("reload"));
-
-                    s.await.unwrap();
+                if let Err(err) = handle_websocket(args, websocket).await {
+                    log::error!(
+                        "An error occurred during websocket connection: {err}"
+                    );
                 }
             })
         })
@@ -129,6 +124,25 @@ async fn main() -> anyhow::Result<()> {
     log::info!("Serving on localhost:{port}");
 
     warp::serve(routes).run(([127, 0, 0, 1], port)).await;
+
+    Ok(())
+}
+
+async fn handle_websocket(
+    args: Arc<Args>,
+    websocket: warp::ws::WebSocket,
+) -> anyhow::Result<()> {
+    let (mut watcher, mut fs_events_receiver) = async_watcher()?;
+
+    watcher.watch(&args.as_ref().target_dir, RecursiveMode::Recursive)?;
+
+    let (mut websocket_sender, _) = websocket.split();
+
+    while let Some(Ok(_)) = fs_events_receiver.recv().await {
+        let s = websocket_sender.send(Message::text("reload"));
+
+        s.await?;
+    }
 
     Ok(())
 }
